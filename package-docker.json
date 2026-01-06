@@ -1,0 +1,12 @@
+{
+  "name": "renewmanager-docker",
+  "version": "1.2.1",
+  "type": "module",
+  "scripts": {
+    "start": "node docker-runner.js"
+  },
+  "dependencies": {
+    "miniflare": "^3.20231030.0",
+    "node-cron": "^3.0.3"
+  }
+}
