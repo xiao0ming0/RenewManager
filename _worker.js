@@ -14,7 +14,7 @@
  * modified: fix previewDate logic v1.4.3
  */
 
-const APP_VERSION = "v1.2.1";
+const APP_VERSION = "v1.2.2";
 
 // ==========================================
 // 1. Core Logic (Lunar & Calc)
@@ -857,6 +857,11 @@ const I18N = {
     lblAgentId: "应用ID (AgentID)",
     lblSecret: "应用密钥 (Secret)",
     lblToUser: "用户账号 (ToUser)",
+    lblRenewInfo: "续费信息：",
+    lblRenewAmount: "💰 续费金额",
+    lblRenewLink: "🔗 续费链接",
+    lblAccount: "👤 账号",
+    lblPassword: "🔑 密码",
   },
   en: {
     scan: "Scan %s items",
@@ -886,12 +891,42 @@ const I18N = {
     lblAgentId: "AgentID",
     lblSecret: "Secret",
     lblToUser: "ToUser",
+    lblRenewInfo: "Renew Info:",
+    lblRenewAmount: "💰 Amount",
+    lblRenewLink: "🔗 Renew Link",
+    lblAccount: "👤 Account",
+    lblPassword: "🔑 Password",
   },
 };
 function t(k, l, ...a) {
   let s = (I18N[l] || I18N.zh)[k] || k;
   a.forEach((x) => (s = s.replace("%s", x)));
   return s;
+}
+
+// 构建服务详情通知内容
+function buildServiceDetails(x, lang) {
+  let details = [];
+  // 金额
+  if (x.renewAmount) {
+    const currency = x.renewCurrency || "CNY";
+    details.push(`${t("lblRenewAmount", lang)}: ${x.renewAmount} ${currency}`);
+  }
+  // 续费链接
+  if (x.purchaseUrl) {
+    details.push(`${t("lblRenewLink", lang)}: ${x.purchaseUrl}`);
+  }
+  // 账号密码
+  if (x.purchaseAccount) {
+    details.push(`${t("lblAccount", lang)}: ${x.purchaseAccount}`);
+  }
+  if (x.purchasePassword) {
+    details.push(`${t("lblPassword", lang)}: ${x.purchasePassword}`);
+  }
+  if (details.length > 0) {
+    return "\n" + t("lblRenewInfo", lang) + "\n" + details.join("\n");
+  }
+  return "";
 }
 
 async function checkAndRenew(env, isSched, lang = "zh") {
@@ -1055,6 +1090,11 @@ async function checkAndRenew(env, isSched, lang = "zh") {
           old: it.lastRenewDate,
           new: newD,
           note: msg,
+          renewAmount: it.renewAmount,
+          renewCurrency: it.renewCurrency,
+          purchaseUrl: it.purchaseUrl,
+          purchaseAccount: it.purchaseAccount,
+          purchasePassword: it.purchasePassword,
         });
         it.lastRenewDate = newD;
         items[i] = it;
@@ -1127,19 +1167,22 @@ async function checkAndRenew(env, isSched, lang = "zh") {
     let pushBody = [];
     if (dis.length) {
       pushBody.push(`【${t("secDis", lang)}】`);
-      dis.forEach((x, i) =>
-        pushBody.push(
-          `${i + 1}. ${x.name} (${t("overdue", lang, Math.abs(x.daysLeft))} / ${x.nextDueDate
-          })\n${x.note}`
-        )
-      );
+      dis.forEach((x, i) => {
+        let entry = `${i + 1}. ${x.name} (${t("overdue", lang, Math.abs(x.daysLeft))} / ${x.nextDueDate})`;
+        if (x.note) entry += `\n${x.note}`;
+        entry += buildServiceDetails(x, lang);
+        pushBody.push(entry);
+      });
       pushBody.push("");
     }
     if (upd.length) {
       pushBody.push(`【${t("secRen", lang)}】`);
-      upd.forEach((x, i) =>
-        pushBody.push(`${i + 1}. ${x.name}: ${x.old} -> ${x.new}\n${x.note}`)
-      );
+      upd.forEach((x, i) => {
+        let entry = `${i + 1}. ${x.name}: ${x.old} -> ${x.new}`;
+        if (x.note) entry += `\n${x.note}`;
+        entry += buildServiceDetails(x, lang);
+        pushBody.push(entry);
+      });
       pushBody.push("");
     }
     if (trig.length) {
@@ -1151,9 +1194,10 @@ async function checkAndRenew(env, isSched, lang = "zh") {
             : x.daysLeft < 0
               ? t("overdue", lang, Math.abs(x.daysLeft))
               : t("left", lang, x.daysLeft);
-        pushBody.push(
-          `${i + 1}. ${x.name}: ${dayStr} (${x.nextDueDate})\n${x.note}`
-        );
+        let entry = `${i + 1}. ${x.name}: ${dayStr} (${x.nextDueDate})`;
+        if (x.note) entry += `\n${x.note}`;
+        entry += buildServiceDetails(x, lang);
+        pushBody.push(entry);
       });
     }
 
@@ -1981,7 +2025,7 @@ const HTML = `<!DOCTYPE html>
 
                 <div class="mt-8 py-6 text-center border-t border-slate-200/60">
                     <p class="text-[10px] text-gray-400 font-mono tracking-[0.2em] uppercase flex justify-center items-center gap-1">
-                        &copy; 2025 <a href="https://github.com/xinling123/renewmanager" target="_blank" class="font-bold text-slate-600 hover:text-blue-600 transition-colors border-b border-dashed border-slate-300 hover:border-blue-600 pb-0.5 mx-1 decoration-0">RenewManager</a>
+                        &copy; 2025 <a href="https://github.com/xiao0ming0/renewmanager" target="_blank" class="font-bold text-slate-600 hover:text-blue-600 transition-colors border-b border-dashed border-slate-300 hover:border-blue-600 pb-0.5 mx-1 decoration-0">RenewManager</a>
                         <span class="text-blue-500 font-bold">${APP_VERSION}</span><span class="mx-2 opacity-30">|</span>DESIGNED BY <span class="font-bold text-slate-600">LOSTFREE</span>
                     </p>
                 </div>                  
