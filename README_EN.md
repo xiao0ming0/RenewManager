@@ -8,7 +8,7 @@
 
 > 📌 **Notice**: This project is modified from [RenewHelper](https://github.com/ieax/renewhelper). Thanks to the original author for the open-source contribution.
 
-**RenewManager** is a full-stack service lifecycle reminder and management tool based on **Cloudflare Workers**. It is designed to manage periodic subscriptions, domain renewals, server expirations, and more. It requires no server (Serverless), incurs zero hosting costs, and features a stunning Mecha-style UI, a powerful Lunar/Solar calendar core, multi-channel notifications, and iCal schedule synchronization. **v1.3.5+ now supports both Worker and Docker deployments.**
+**RenewManager** is a full-stack service lifecycle reminder and management tool based on **Cloudflare Workers**. It is designed to manage periodic subscriptions, domain renewals, server expirations, and more. It requires no server (Serverless), incurs zero hosting costs, and features a stunning Mecha-style UI, a powerful Lunar/Solar calendar core, multi-channel notifications, and iCal schedule synchronization. **v1.3.5+ now supports both Worker and Docker deployments. v1.3.9+ adds income/expense tracking, sortable table with memory, and improved manual renewal features.**
 
 <div align="center">
   <img src="./assets/mainUI_darkEN_shot.png" alt="RenewManager 界面预览" width="800">
@@ -23,6 +23,10 @@
   - Perfect for handling monthly/yearly subscriptions (Solar) or birthdays/traditional festivals (Lunar).
   - Supports automatic calculation based on Day, Month, or Year intervals.
   - Two modes: "Cycle Subscription" (Repeating) and "Expiration Reset" (Manual extension).
+- **💰 Income/Expense Tracking**:
+  - Mark each service as **Income** or **Expense**.
+  - Automatically calculates monthly and yearly totals.
+  - Real-time statistics panel displays income/expense overview for better financial management.
 - **🔔 Multi-Channel Notifications**:
   - Built-in support for **Telegram, Bark, PushPlus, NotifyX, Resend (Email), Webhook, and WeChat Work**.
   - Customizable advance notice days and daily push times.
@@ -42,6 +46,8 @@
   - Fully responsive design for mobile and desktop.
   - Bilingual interface (English/Chinese).
   - Data Import/Export for backup.
+  - Sortable table columns with persistent sort state (survives page refresh).
+  - No pagination - view all services at once.
 
 ---
 
@@ -271,6 +277,22 @@ docker compose up -d
 
 ---
 
+## 📋 Version Updates (v1.3.9)
+
+### New Features
+- ✨ **Income/Expense Tracking**: Mark each service as income or expense, automatically calculate monthly and yearly totals
+- ✨ **Persistent Table Sorting**: Sortable columns with state saved to browser storage, persists after page refresh
+- ✨ **Improved Manual Renewal**: Manual renewal extends expiration date by one cycle without changing last renewal date
+- ✨ **No Pagination**: All services displayed at once, no pagination needed
+
+### Improvements
+- 🔧 Removed search functionality for cleaner interface
+- 🔧 Removed tag input from form for simplicity
+- 🔧 Detail dialog shows type (Income/Expense) and auto-renewal status
+- 🔧 New services default to auto-renewal disabled, enable manually if needed
+
+---
+
 ## ⚙️ Configuration
 
 After deployment, visit your Worker URL or custom domain (e.g., `https://renewmanager.your-name.workers.dev`).
@@ -305,27 +327,27 @@ Configure these in "Settings" -> "Notifications":
 ### Adding a Service
 
 - **Name**: Service name (e.g., "Netflix 4K", "Google Voice - 8888").
-- **Tags**: For categorization (e.g., `Media`, `Server`, `Domain`, `PhoneNumber`). Supports multiple tags.
+- **Type**: Mark the service as **Income** or **Expense** for tracking and financial management.
 - **Renewal Amount**: Record the renewal cost, supports CNY, USD, and EUR currencies.
 - **Purchase Information**:
   - **Purchase URL**: Link to the service purchase page (clickable).
   - **Purchase Account**: Account used to login to the purchase platform.
   - **Purchase Password**: Corresponding login password (securely stored).
-- **Mode**:
-  - 📅 **Cycle Subscription**: For items that expire every fixed cycle (e.g., 1 Month / 1 Year). Good for monthly subs, VPS renewals.
-  - ⏳ **Expiration Reset**: For items that need manual/auto handling upon expiration to extend validity. Good for eSIM validity extension (e.g., extend 180 days on top-up).
-- **Lunar Cycle**: Enable this for calculations based on the Lunar calendar (Birthdays, traditional events).
+- **Cycle Settings**:
+  - **Interval**: Set the renewal cycle (e.g., 30 days, 1 month, 1 year).
+  - **Lunar Cycle**: Enable this for calculations based on the Lunar calendar (Birthdays, traditional events).
 - **Automation Policy**:
-  - **Auto-Renew**: Automatically extends the next due date by one cycle upon expiration.
+  - **Auto-Renew**: Automatically extends the next due date by one cycle upon expiration (disabled by default, enable manually).
   - **Auto-Disable**: Automatically marks the service as disabled if it remains overdue for a specified number of days.
+- **Manual Renewal**: Click the manual renewal button to extend the expiration date by one cycle without changing the last renewal date.
 
 ### Viewing Details
 
 Click the view button in the "Details" column of the service list to see all information about that service, including:
-- Service status, type, cycle, and other basic information
-- Creation date, last renewal date
+- Service status, type (Income/Expense), auto-renewal status, and other basic information
+- Creation date, last renewal date, next due date
 - Renewal amount, purchase URL, account and password (if provided)
-- Tag categories
+- Tag categories (if set)
 
 <div align="center">
   <img src="./assets/AddUI_darkEN_shot.png" alt="RenewManager 界面预览" width="600">
@@ -334,6 +356,18 @@ Click the view button in the "Details" column of the service list to see all inf
 ### Viewing Logs
 
 Click the **LOGS** button on the main interface to view history of automation tasks, push results, and operation audits.
+
+### Table Sorting
+
+- Click column headers to sort (ascending/descending).
+- Sort state is automatically saved to browser local storage and persists after page refresh.
+- Sortable columns: Service Name, Next Due, Uptime, Last Renew, Cycle Period, Amount.
+
+### Income/Expense Statistics
+
+- Top statistics panel displays: Total Services, Expiring Soon, Expired, Monthly Income, Monthly Expense.
+- Statistics automatically calculate based on each service's type and amount.
+- Calculations consider service cycles (day/month/year) and convert to monthly/yearly amounts.
 
 ### ICS Calendar Subscription
 

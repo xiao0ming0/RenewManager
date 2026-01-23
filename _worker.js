@@ -1,5 +1,5 @@
 /**
- * Cloudflare Worker: RenewManager (v1.2.1)
+ * Cloudflare Worker: RenewManager (v1.4.5)
  * Author: LOSTFREE
  * Features: Multi-Channel Notify, Import/Export, Channel Test, Bilingual UI, Precise ICS Alarm
  * added: sort, filter v1.3.4
@@ -14,7 +14,7 @@
  * modified: fix previewDate logic v1.4.3
  */
 
-const APP_VERSION = "v1.2.2";
+const APP_VERSION = "v1.4.5";
 
 // ==========================================
 // 1. Core Logic (Lunar & Calc)
@@ -361,7 +361,7 @@ const DataStore = {
       enableNotify: true,
       autoDisableDays: 30,
       language: "zh",
-      timezone: "UTC",
+      timezone: "Asia/Shanghai",
       jwtSecret: "",
       calendarToken: "",
       enabledChannels: [],
@@ -763,37 +763,35 @@ async function webhookAdapterImpl(c, title, body) {
 // 4. Logic Controllers
 // ==========================================
 
-function calculateStatus(item, timezone = "UTC") {
-  // 使用时区感知的“今天”，而不是 UTC 的今天
+function calculateStatus(item, timezone = "Asia/Shanghai") {
+  // 使用时区感知的"今天"，默认使用北京时间
   const today = Calc.getTzToday(timezone);
 
-  const cDate = item.createDate || Calc.toYMD(today),
-    rDate = item.lastRenewDate || cDate;
-  const interval = Number(item.intervalDays),
-    unit = item.cycleUnit || "day";
-  const rObj = Calc.parseYMD(rDate);
-  let nextObj;
-
-  if (item.useLunar) {
-    let l = LUNAR_DATA.solar2lunar(
-      rObj.getUTCFullYear(),
-      rObj.getUTCMonth() + 1,
-      rObj.getUTCDate()
-    );
-    if (l) {
-      let nl = calcBiz.addPeriod(l, interval, unit);
-      let s = calcBiz.l2s(nl);
-      nextObj = new Date(Date.UTC(s.year, s.month - 1, s.day));
-    } else nextObj = new Date(rObj);
-  } else {
-    nextObj = new Date(rObj);
-    if (unit === "year")
-      nextObj.setUTCFullYear(nextObj.getUTCFullYear() + interval);
-    else if (unit === "month")
-      nextObj.setUTCMonth(nextObj.getUTCMonth() + interval);
-    else nextObj.setUTCDate(nextObj.getUTCDate() + interval);
+  const cDate = item.createDate || Calc.toYMD(today);
+  
+  // 必须要有 nextDueDate，如果没有则返回错误状态
+  if (!item.nextDueDate) {
+    // 如果没有 nextDueDate，返回一个错误状态，提示需要重新设置
+    return {
+      ...item,
+      enabled: item.enabled !== false,
+      cycleUnit: item.cycleUnit || "day",
+      createDate: cDate,
+      lastRenewDate: item.lastRenewDate || cDate,
+      serviceDays: Math.floor((today - Calc.parseYMD(cDate)) / 86400000),
+      daysLeft: 999999, // 标记为无效
+      nextDueDate: "",
+      nextDueDateLunar: "",
+      lastRenewDateLunar: "",
+      tags: Array.isArray(item.tags) ? item.tags : [],
+      useLunar: !!item.useLunar,
+      notifyTime: item.notifyTime || "08:00",
+    };
   }
 
+  // 基于 nextDueDate 计算
+  const nextObj = Calc.parseYMD(item.nextDueDate);
+  
   let lNext = "",
     lLast = "";
   if (item.useLunar) {
@@ -803,23 +801,25 @@ function calculateStatus(item, timezone = "UTC") {
       nextObj.getUTCDate()
     );
     if (ln) lNext = ln.fullStr;
-    const ll = LUNAR_DATA.solar2lunar(
-      rObj.getUTCFullYear(),
-      rObj.getUTCMonth() + 1,
-      rObj.getUTCDate()
-    );
-    if (ll) lLast = ll.fullStr;
+    if (item.lastRenewDate) {
+      const ll = LUNAR_DATA.solar2lunar(
+        Calc.parseYMD(item.lastRenewDate).getUTCFullYear(),
+        Calc.parseYMD(item.lastRenewDate).getUTCMonth() + 1,
+        Calc.parseYMD(item.lastRenewDate).getUTCDate()
+      );
+      if (ll) lLast = ll.fullStr;
+    }
   }
 
   return {
     ...item,
     enabled: item.enabled !== false,
-    cycleUnit: unit,
+    cycleUnit: item.cycleUnit || "day",
     createDate: cDate,
-    lastRenewDate: rDate,
+    lastRenewDate: item.lastRenewDate || cDate, // 保持记录，但不用于计算
     serviceDays: Math.floor((today - Calc.parseYMD(cDate)) / 86400000),
     daysLeft: Math.round((nextObj - today) / 86400000),
-    nextDueDate: Calc.toYMD(nextObj),
+    nextDueDate: item.nextDueDate,
     nextDueDateLunar: lNext,
     lastRenewDateLunar: lLast,
     tags: Array.isArray(item.tags) ? item.tags : [],
@@ -961,7 +961,7 @@ async function checkAndRenew(env, isSched, lang = "zh") {
   let nowH = 0, nowM = 0;
   try {
     const fmt = new Intl.DateTimeFormat("en-US", {
-      timeZone: s.timezone || "UTC",
+      timeZone: s.timezone || "Asia/Shanghai",
       hour12: false,
       hour: "numeric",
       minute: "numeric",
@@ -1010,85 +1010,59 @@ async function checkAndRenew(env, isSched, lang = "zh") {
     // --- 逻辑 B: 自动续期 ---
     else if (iAutoRenew && days <= -Math.abs(iRenewDays)) {
       log(t("autoRenew", lang, it.name));
-      const rObj = Calc.parseYMD(it.lastRenewDate),
+      // 基于 nextDueDate 往后推一个周期，而不是基于 lastRenewDate
+      const nextDueObj = Calc.parseYMD(it.nextDueDate || it.lastRenewDate || it.createDate),
         unit = it.cycleUnit || "day",
         intv = Number(it.intervalDays);
 
-      // 防止死循环保护
-      // 防止 intervalDays 为 0 或负数导致死循环，耗尽 Worker CPU 资源
-      let loopSafe = 0;
-      const MAX_LOOPS = 300; // 限制最大推算次数（300个周期通常足够覆盖数年）
-
-      let currentRenew = new Date(rObj);
+      let newNextDueDate;
 
       if (it.useLunar) {
         let l = LUNAR_DATA.solar2lunar(
-          rObj.getUTCFullYear(),
-          rObj.getUTCMonth() + 1,
-          rObj.getUTCDate()
+          nextDueObj.getUTCFullYear(),
+          nextDueObj.getUTCMonth() + 1,
+          nextDueObj.getUTCDate()
         );
-        // 增加 l 对象的非空校验，防止农历转换失败导致 crash
         if (!l) {
           log(`[ERR] Lunar conversion failed for ${it.name}`);
+          newNextDueDate = new Date(nextDueObj);
+          if (unit === "year")
+            newNextDueDate.setUTCFullYear(newNextDueDate.getUTCFullYear() + intv);
+          else if (unit === "month")
+            newNextDueDate.setUTCMonth(newNextDueDate.getUTCMonth() + intv);
+          else newNextDueDate.setUTCDate(newNextDueDate.getUTCDate() + intv);
         } else {
-          while (true) {
-            // 1. 安全中断检测
-            if (++loopSafe > MAX_LOOPS) {
-              log(
-                `[WARN] Loop Limit Exceeded for item: ${it.name} (Check interval/date settings)`
-              );
-              break;
-            }
-
-            let nextL = calcBiz.addPeriod(l, intv, unit);
-            let sol = calcBiz.l2s(nextL);
-
-            // 2. 防止农历逆向转换失败
-            if (!sol) {
-              log(`[ERR] Lunar reverse calc failed for ${it.name}`);
-              break;
-            }
-
-            let nextTime = new Date(Date.UTC(sol.year, sol.month - 1, sol.day));
-            if (nextTime > today) break;
-            currentRenew = nextTime;
-            l = nextL;
+          let nl = calcBiz.addPeriod(l, intv, unit);
+          let sol = calcBiz.l2s(nl);
+          if (!sol) {
+            log(`[ERR] Lunar reverse calc failed for ${it.name}`);
+            newNextDueDate = new Date(nextDueObj);
+            if (unit === "year")
+              newNextDueDate.setUTCFullYear(newNextDueDate.getUTCFullYear() + intv);
+            else if (unit === "month")
+              newNextDueDate.setUTCMonth(newNextDueDate.getUTCMonth() + intv);
+            else newNextDueDate.setUTCDate(newNextDueDate.getUTCDate() + intv);
+          } else {
+            newNextDueDate = new Date(Date.UTC(sol.year, sol.month - 1, sol.day));
           }
         }
       } else {
-        while (true) {
-          // 1. 安全中断检测
-          if (++loopSafe > MAX_LOOPS) {
-            log(
-              `[WARN] Loop Limit Exceeded for item: ${it.name} (Check interval/date settings)`
-            );
-            break;
-          }
-
-          let nextCandidate = new Date(currentRenew);
-          if (unit === "year")
-            nextCandidate.setUTCFullYear(nextCandidate.getUTCFullYear() + intv);
-          else if (unit === "month")
-            nextCandidate.setUTCMonth(nextCandidate.getUTCMonth() + intv);
-          else nextCandidate.setUTCDate(nextCandidate.getUTCDate() + intv);
-
-          // 2. 防止日期未发生变化（如 interval=0）导致的死循环
-          if (nextCandidate.getTime() <= currentRenew.getTime()) {
-            log(`[ERR] Interval too small or zero for ${it.name}`);
-            break;
-          }
-
-          if (nextCandidate > today) break;
-          currentRenew = nextCandidate;
-        }
+        newNextDueDate = new Date(nextDueObj);
+        if (unit === "year")
+          newNextDueDate.setUTCFullYear(newNextDueDate.getUTCFullYear() + intv);
+        else if (unit === "month")
+          newNextDueDate.setUTCMonth(newNextDueDate.getUTCMonth() + intv);
+        else newNextDueDate.setUTCDate(newNextDueDate.getUTCDate() + intv);
       }
 
-      const newD = Calc.toYMD(currentRenew);
-      if (newD !== it.lastRenewDate) {
+      const oldNextDue = it.nextDueDate || Calc.toYMD(nextDueObj);
+      const newNextDue = Calc.toYMD(newNextDueDate);
+      
+      if (newNextDue !== oldNextDue) {
         upd.push({
           name: it.name,
-          old: it.lastRenewDate,
-          new: newD,
+          old: oldNextDue,
+          new: newNextDue,
           note: msg,
           renewAmount: it.renewAmount,
           renewCurrency: it.renewCurrency,
@@ -1096,7 +1070,9 @@ async function checkAndRenew(env, isSched, lang = "zh") {
           purchaseAccount: it.purchaseAccount,
           purchasePassword: it.purchasePassword,
         });
-        it.lastRenewDate = newD;
+        // 更新 nextDueDate，同时更新 lastRenewDate 作为记录
+        it.nextDueDate = newNextDue;
+        it.lastRenewDate = Calc.toYMD(today); // 记录续期日期为今天
         items[i] = it;
         changed = true;
       }
@@ -1331,6 +1307,8 @@ app.post(
       notifyTime: i.notifyTime || "08:00",
       autoRenew: i.autoRenew !== false,
       autoRenewDays: i.autoRenewDays !== null ? Number(i.autoRenewDays) : null,
+      transactionType: i.transactionType || 'expense',
+      type: i.type || 'cycle', // 保持向后兼容，默认cycle
     }));
 
     const currentSettings = await DataStore.getSettings(env);
@@ -1453,7 +1431,7 @@ app.get("/api/calendar.ics", async (req, env, url) => {
     },
   }[lang];
 
-  const userTz = settings.timezone || "UTC";
+  const userTz = settings.timezone || "Asia/Shanghai";
 
   // ICS 文本转义函数
   const formatIcsText = (str) => {
@@ -1853,14 +1831,27 @@ const HTML = `<!DOCTYPE html>
                     </div>
                 </div>
                 
-                <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
-                    <div class="mecha-panel p-6 pl-8 border-l-4 !border-l-blue-500"><div class="text-blue-600 text-xs font-bold font-mono mb-2 tracking-widest">{{ t('totalServices') }}</div><div class="text-5xl font-black font-mono text-textMain">{{ list.length }}</div></div>
-                    <div class="mecha-panel p-6 pl-8 border-l-4 !border-l-amber-500"><div class="text-amber-600 text-xs font-bold font-mono mb-2 tracking-widest">{{ t('expiringSoon') }}</div><div class="text-5xl font-black font-mono text-amber-500">{{ expiringCount }}</div></div>
-                    <div class="mecha-panel p-6 pl-8 border-l-4 !border-l-red-500"><div class="text-red-600 text-xs font-bold font-mono mb-2 tracking-widest">{{ t('expiredAlert') }}</div><div class="text-5xl font-black font-mono text-red-500">{{ expiredCount }}</div></div>
+                <div class="grid grid-cols-1 md:grid-cols-5 gap-4 mb-6">
+                    <div class="mecha-panel p-4 pl-6 border-l-4 !border-l-blue-500"><div class="text-blue-600 text-xs font-bold font-mono mb-1 tracking-widest">{{ t('totalServices') }}</div><div class="text-4xl font-black font-mono text-textMain">{{ list.length }}</div></div>
+                    <div class="mecha-panel p-4 pl-6 border-l-4 !border-l-amber-500"><div class="text-amber-600 text-xs font-bold font-mono mb-1 tracking-widest">{{ t('expiringSoon') }}</div><div class="text-4xl font-black font-mono text-amber-500">{{ expiringCount }}</div></div>
+                    <div class="mecha-panel p-4 pl-6 border-l-4 !border-l-red-500"><div class="text-red-600 text-xs font-bold font-mono mb-1 tracking-widest">{{ t('expiredAlert') }}</div><div class="text-4xl font-black font-mono text-red-500">{{ expiredCount }}</div></div>
+                    <div class="mecha-panel p-4 pl-6 border-l-4 !border-l-green-500">
+                        <div class="text-green-600 text-xs font-bold font-mono mb-1 tracking-widest">{{ lang==='zh'?'收入统计':'INCOME' }}</div>
+                        <div class="text-2xl font-black font-mono text-green-600 mb-0.5">{{ monthlyIncome.toFixed(2) }}</div>
+                        <div class="text-[10px] text-textDim font-mono mb-1">{{ lang==='zh'?'每月':'MONTHLY' }}</div>
+                        <div class="text-2xl font-black font-mono text-green-600">{{ yearlyIncome.toFixed(2) }}</div>
+                        <div class="text-[10px] text-textDim font-mono">{{ lang==='zh'?'每年':'YEARLY' }}</div>
+                    </div>
+                    <div class="mecha-panel p-4 pl-6 border-l-4 !border-l-orange-500">
+                        <div class="text-orange-600 text-xs font-bold font-mono mb-1 tracking-widest">{{ lang==='zh'?'支出统计':'EXPENSE' }}</div>
+                        <div class="text-2xl font-black font-mono text-orange-600 mb-0.5">{{ monthlyExpense.toFixed(2) }}</div>
+                        <div class="text-[10px] text-textDim font-mono mb-1">{{ lang==='zh'?'每月':'MONTHLY' }}</div>
+                        <div class="text-2xl font-black font-mono text-orange-600">{{ yearlyExpense.toFixed(2) }}</div>
+                        <div class="text-[10px] text-textDim font-mono">{{ lang==='zh'?'每年':'YEARLY' }}</div>
+                    </div>
                 </div>
 
                 <div class="filter-row" v-if="list.length > 0">
-                    <div class="search-box"><el-input v-model="searchKeyword" :placeholder="t('searchPlaceholder')" clearable :prefix-icon="Search"></el-input></div>
                     <div class="filter-bar" v-if="allTags.length > 0">
                         <div class="filter-chip" :class="{active:currentTag===''}" @click="currentTag=''">{{ t('tagAll') }}<div v-if="currentTag===''" class="chip-active-bar"></div></div>
                         <div class="filter-chip" :class="{active:currentTag==='DISABLED'}" @click="currentTag='DISABLED'">{{ t('disabledFilter') }}<span class="tag-count-badge">{{ disabledCount }}</span><div v-if="currentTag==='DISABLED'" class="chip-active-bar"></div></div>
@@ -1873,8 +1864,8 @@ const HTML = `<!DOCTYPE html>
                     <div class="hud-bar-container"><div class="hud-text" style="margin-right:12px;color:#94a3b8">MATCHED: <span class="text-white text-lg mx-1">{{ filteredList.length }}</span></div><div class="hud-bar" style="animation-delay:0s"></div><div class="hud-bar" style="animation-delay:0.1s"></div><div class="hud-bar" style="animation-delay:0.2s"></div><div class="hud-bar" style="animation-delay:0.3s"></div><div class="hud-bar" style="animation-delay:0.4s"></div></div>
                 </div>
   <div class="mecha-panel p-1 !border-l-0">
-    <el-table :key="tableKey" :data="pagedList" style="width:100%" v-loading="loading" :row-class-name="tableRowClassName" size="large" @sort-change="handleSortChange" @filter-change="handleFilterChange" :default-sort="{prop: 'daysLeft', order: 'ascending'}">       
-        <el-table-column :label="t('serviceName')" min-width="230">
+    <el-table :key="tableKey" :data="filteredList" style="width:100%" v-loading="loading" :row-class-name="tableRowClassName" size="large" @sort-change="handleSortChange" @filter-change="handleFilterChange" :default-sort="sortState">       
+        <el-table-column :label="t('serviceName')" min-width="230" sortable="custom" prop="name">
             <template #default="scope">
                 <div class="flex items-center gap-4">
                     <div class="w-1 h-8 shrink-0 rounded-[1px] transition-all" :class="[scope.row.enabled?'bar-scanner':'bg-gray-300']" :style="scope.row.enabled?{animationDelay:(scope.$index*0.15)+'s'}:{}"></div>
@@ -1886,11 +1877,11 @@ const HTML = `<!DOCTYPE html>
             </template>
         </el-table-column>
 
-        <el-table-column :label="t('type')" width="100" prop="type" column-key="type" :filters="typeFilters">
+        <el-table-column :label="lang==='zh'?'类型':'Type'" width="100" prop="transactionType" column-key="transactionType">
             <template #default="scope">
                 <div class="flex items-center h-full">
-                    <span v-if="scope.row.type==='reset'" class="text-[9px] font-bold bg-amber-50 text-amber-600 border border-amber-200 px-1.5 py-0.5 tracking-wider whitespace-nowrap">{{ t('typeReset') }}</span>
-                    <span v-else class="text-[9px] font-bold bg-blue-50 text-blue-600 border border-blue-200 px-1.5 py-0.5 tracking-wider whitespace-nowrap">{{ t('typeCycle') }}</span>
+                    <span v-if="scope.row.transactionType==='income'" class="text-[9px] font-bold bg-green-50 text-green-600 border border-green-200 px-1.5 py-0.5 tracking-wider whitespace-nowrap">{{ lang==='zh'?'收入':'INCOME' }}</span>
+                    <span v-else class="text-[9px] font-bold bg-orange-50 text-orange-600 border border-orange-200 px-1.5 py-0.5 tracking-wider whitespace-nowrap">{{ lang==='zh'?'支出':'EXPENSE' }}</span>
                 </div>
             </template>
         </el-table-column>
@@ -1924,14 +1915,14 @@ const HTML = `<!DOCTYPE html>
             </template>
         </el-table-column>
 
-        <el-table-column :label="t('cyclePeriod')" width="90">
+        <el-table-column :label="t('cyclePeriod')" width="90" sortable="custom" prop="intervalDays">
             <template #default="scope">
                 <span class="font-mono font-bold text-lg text-textDim">{{ scope.row.intervalDays }}</span> 
                 <span class="text-[10px] text-gray-400 uppercase align-top">{{ t('unit.'+(scope.row.cycleUnit||'day')) }}</span>
             </template>
         </el-table-column>
 
-        <el-table-column :label="t('amount')" width="120">
+        <el-table-column :label="t('amount')" width="120" sortable="custom" prop="amount">
             <template #default="scope">
                 <span v-if="scope.row.amount" class="font-mono font-bold text-textMain">{{ scope.row.amount }} <span class="text-[10px] text-gray-400">{{ scope.row.currency || 'CNY' }}</span></span>
                 <span v-else class="text-gray-300">-</span>
@@ -2006,22 +1997,6 @@ const HTML = `<!DOCTYPE html>
         </el-table-column>
                     </el-table>
                 </div>
-                <div class="mt-4 flex justify-end">
-                    <div class="mecha-panel p-2 inline-block">
-                        <el-pagination
-                            v-model:current-page="currentPage"
-                            v-model:page-size="pageSize"
-                            :page-sizes="[10, 15, 30, 50, 100]"
-                            :background="true"
-                            :layout="paginationLayout"
-                            :small="windowWidth < 640"
-                            :pager-count="windowWidth < 640 ? 5 : 7"
-                            :total="filteredList.length"
-                            @size-change="() => window.scrollTo({top: 0, behavior: 'smooth'})"
-                            @current-change="() => window.scrollTo({top: 0, behavior: 'smooth'})"
-                        />
-                    </div>
-                </div>
 
                 <div class="mt-8 py-6 text-center border-t border-slate-200/60">
                     <p class="text-[10px] text-gray-400 font-mono tracking-[0.2em] uppercase flex justify-center items-center gap-1">
@@ -2034,10 +2009,14 @@ const HTML = `<!DOCTYPE html>
             <el-dialog v-model="dialogVisible" :title="isEdit?t('editService'):t('newService')" width="680px" align-center class="!rounded-none mecha-panel" style="clip-path:polygon(10px 0,100% 0,100% calc(100% - 10px),calc(100% - 10px) 100%,0 100%,0 10px);">
                 <el-form :model="form" label-position="top">
                     <el-form-item :label="t('formName')"><el-input v-model="form.name" size="large"></el-input></el-form-item>
-                    <el-form-item :label="t('tags')"><el-select v-model="form.tags" multiple filterable allow-create default-first-option :reserve-keyword="false" :placeholder="t('tagPlaceholder')" style="width:100%" size="large"><el-option v-for="tag in allTags" :key="tag" :label="tag" :value="tag"></el-option></el-select></el-form-item>
 
-                    <div class="flex flex-col sm:flex-row items-end gap-4 mb-4">
-                        <el-form-item :label="t('formType')" class="!mb-0 flex-1 w-full"><div class="radio-group-fix"><div class="radio-item" :class="{active:form.type==='cycle'}" @click="form.type='cycle'">📅 {{ t('cycle') }}</div><div class="radio-item" :class="{active:form.type==='reset'}" @click="form.type='reset'">⏳ {{ t('reset') }}</div></div></el-form-item>
+                <div class="flex flex-col sm:flex-row items-end gap-4 mb-4">
+                        <el-form-item :label="lang==='zh'?'类型':'Type'" class="!mb-0 flex-1 w-full bg-slate-50 dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-sm px-3 pt-2 pb-1">
+                            <el-select v-model="form.transactionType" style="width:100%" size="large">
+                                <el-option :label="lang==='zh'?'支出':'Expense'" value="expense"></el-option>
+                                <el-option :label="lang==='zh'?'收入':'Income'" value="income"></el-option>
+                            </el-select>
+                        </el-form-item>
                         <div class="w-px h-8 bg-slate-300 hidden sm:block mb-1"></div>
                         <el-form-item :label="t('interval')" class="!mb-0 w-48">
                             <el-input v-model.number="form.intervalDays" type="number" :min="1">
@@ -2067,15 +2046,15 @@ const HTML = `<!DOCTYPE html>
                         </el-form-item>
                     </div>
 
-                    <div v-if="previewData" class="relative mb-4 overflow-hidden rounded-sm border border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-900 shadow-sm group">
+                    <div v-if="previewData || (isEdit && form.nextDueDate)" class="relative mb-4 overflow-hidden rounded-sm border border-slate-200 bg-slate-50 dark:border-slate-700 dark:bg-slate-900 shadow-sm group">
                         <div class="flex justify-between items-center p-3 pl-5">
                             <div>
                                 <div class="text-[10px] font-bold text-slate-400 uppercase tracking-wider font-mono mb-0.5">{{ t('nextDue') }}</div>
-                                <div class="text-xl font-bold text-slate-700 dark:text-slate-200 font-mono tracking-tight leading-none">{{ previewData.date }}</div>
+                                <div class="text-xl font-bold text-slate-700 dark:text-slate-200 font-mono tracking-tight leading-none">{{ isEdit && form.nextDueDate ? form.nextDueDate : (previewData ? previewData.date : '') }}</div>
                             </div>
                             <div class="text-right">
-                                 <div class="text-[10px] text-slate-400 font-mono mb-0.5">{{ t('previewCalc') }}</div>
-                                 <div class="text-lg font-bold text-blue-600 dark:text-blue-400 font-mono leading-none">{{ previewData.diff }}</div>
+                                 <div class="text-[10px] text-slate-400 font-mono mb-0.5">{{ isEdit ? (lang==='zh'?'当前到期时间':'Current Due Date') : t('previewCalc') }}</div>
+                                 <div class="text-lg font-bold text-blue-600 dark:text-blue-400 font-mono leading-none">{{ isEdit && form.nextDueDate ? editDueDiff : (previewData ? previewData.diff : '') }}</div>
                             </div>
                         </div>
                     </div>
@@ -2425,10 +2404,15 @@ const HTML = `<!DOCTYPE html>
                         </el-tag>
                     </div>
                     <div class="flex justify-between border-b border-slate-100 dark:border-slate-800 pb-2">
-                        <span class="text-slate-500 font-bold">{{ t('lblMode') }}</span>
-                        <span class="font-bold text-textMain">
-                            {{ currentDetailItem.type === 'cycle' ? t('typeCycle') : t('typeReset') }}
-                        </span>
+                        <span class="text-slate-500 font-bold">{{ lang==='zh'?'类型':'Type' }}</span>
+                        <span v-if="currentDetailItem.transactionType==='income'" class="text-[9px] font-bold bg-green-50 text-green-600 border border-green-200 px-1.5 py-0.5 tracking-wider whitespace-nowrap">{{ lang==='zh'?'收入':'INCOME' }}</span>
+                        <span v-else class="text-[9px] font-bold bg-orange-50 text-orange-600 border border-orange-200 px-1.5 py-0.5 tracking-wider whitespace-nowrap">{{ lang==='zh'?'支出':'EXPENSE' }}</span>
+                    </div>
+                    <div class="flex justify-between border-b border-slate-100 dark:border-slate-800 pb-2">
+                        <span class="text-slate-500 font-bold">{{ lang==='zh'?'是否自动续期':'Auto Renew' }}</span>
+                        <el-tag :type="currentDetailItem.autoRenew ? 'success' : 'info'" size="small">
+                            {{ currentDetailItem.autoRenew ? (lang==='zh'?'是':'Yes') : (lang==='zh'?'否':'No') }}
+                        </el-tag>
                     </div>
                     <div class="flex justify-between border-b border-slate-100 dark:border-slate-800 pb-2">
                         <span class="text-slate-500 font-bold">{{ t('lblInterval') }}</span>
@@ -2547,7 +2531,7 @@ const HTML = `<!DOCTYPE html>
             lblHeaders: '请求头 (JSON)', lblBody: '消息体 (JSON)',
             lblCorpId: '企业ID', lblAgentId: '应用ID', lblSecret: '应用密钥', lblToUser: '用户账号',
             lblStatus: '状态', lblMode: '模式', lblInterval: '周期', lblCreateDate: '创建日期', lblLastRenew: '上次续期',
-            tag:{alert:'触发提醒',renew:'自动续期',disable:'自动禁用',normal:'检查正常'},msg:{confirmRenew: '确认将 [%s] 的更新日期设置为今天吗？',renewSuccess: '续期成功！日期已更新: %s -> %t',tokenReset: '令牌已重置，请更新订阅地址', copyOk: '链接已复制', exportSuccess: '备份已下载',importSuccess: '数据恢复成功，即将刷新',importFail: '导入失败，请检查文件格式',passReq:'请输入密码',saved:'保存成功',saveFail:'保存失败',cleared:'已清空',clearFail:'清空失败',loginFail:'验证失败',loadLogFail:'日志加载失败',confirmDel:'确认删除此项目?',dateError:'上次更新日期不能早于创建日期',nameReq:'服务名称不能为空',nameExist:'服务名称已存在',futureError:'上次续期不能是未来时间',serviceDisabled:'服务已停用',serviceEnabled:'服务已启用',execFinish: '执行完毕!'},tags:'标签',tagPlaceholder:'输入标签回车创建',searchPlaceholder:'搜索标题或备注...',tagsCol:'标签',tagAll:'全部',useLunar:'农历周期',lunarTip:'按农历日期计算周期',yes:'是',no:'否',timezone:'偏好时区',disabledFilter:'已停用',policyConfig:'自动化策略',policyNotify:'提醒提前期',policyAuto:'自动续期',policyRenewDay:'过期续期天数',useGlobal:'全局默认',autoRenewOnDesc:'过期自动续期',autoRenewOffDesc:'过期自动禁用',previewCalc:'根据上次续期日期和周期计算',nextDue:'下次到期',
+            tag:{alert:'触发提醒',renew:'自动续期',disable:'自动禁用',normal:'检查正常'},msg:{confirmRenew: '确认将 [%s] 的到期时间往后延期一个周期吗？',renewSuccess: '续期成功！日期已更新: %s -> %t',tokenReset: '令牌已重置，请更新订阅地址', copyOk: '链接已复制', exportSuccess: '备份已下载',importSuccess: '数据恢复成功，即将刷新',importFail: '导入失败，请检查文件格式',passReq:'请输入密码',saved:'保存成功',saveFail:'保存失败',cleared:'已清空',clearFail:'清空失败',loginFail:'验证失败',loadLogFail:'日志加载失败',confirmDel:'确认删除此项目?',dateError:'上次更新日期不能早于创建日期',nameReq:'服务名称不能为空',nameExist:'服务名称已存在',futureError:'上次续期不能是未来时间',serviceDisabled:'服务已停用',serviceEnabled:'服务已启用',execFinish: '执行完毕!'},tags:'标签',tagPlaceholder:'输入标签回车创建',searchPlaceholder:'搜索标题或备注...',tagsCol:'标签',tagAll:'全部',useLunar:'农历周期',lunarTip:'按农历日期计算周期',yes:'是',no:'否',timezone:'偏好时区',disabledFilter:'已停用',policyConfig:'自动化策略',policyNotify:'提醒提前期',policyAuto:'自动续期',policyRenewDay:'过期续期天数',useGlobal:'全局默认',autoRenewOnDesc:'过期自动续期',autoRenewOffDesc:'过期自动禁用',previewCalc:'根据上次续期日期和周期计算',nextDue:'下次到期',
             colDetails: '详情', amount: '续费金额', purchaseUrl: '购买地址', purchaseAccount: '购买账户', purchasePassword: '购买密码', detailsTitle: '项目详情', currency: '币种'},
             en: { filter:{expired:'Overdue/Today', w7:'Within 7 Days', w30:'Within 30 Days', future:'Future(>30d)', new:'New (<30d)', stable:'Stable (1m-1y)', long:'Long Term (>1y)', m1:'Last Month', m6:'Last 6 Months', year:'This Year', earlier:'Earlier'}, secPref: 'PREFERENCES',manualRenew: 'Quick Renew',tipToggle: 'Toggle Status',tipRenew: 'Quick Renew',tipEdit: 'Edit Service',tipDelete: 'Delete Service',secNotify: 'NOTIFICATIONS',secData: 'DATA MANAGEMENT',lblIcsTitle: 'CALENDAR SUBSCRIPTION',lblIcsUrl: 'ICS URL (iOS/Google Calendar)',btnCopy: 'COPY',btnResetToken: 'RESET TOKEN',loginTitle:'SYSTEM ACCESS',passwordPlaceholder:'Authorization Key',unlockBtn:'UNLOCK TERMINAL',check:'CHECK',add:'ADD NEW',settings:'CONFIG',logs:'LOGS',logout:'LOGOUT',totalServices:'TOTAL SERVICES',expiringSoon:'EXPIRING SOON',expiredAlert:'EXPIRED / ALERT',serviceName:'SERVICE NAME',type:'TYPE',nextDue:'NEXT DUE',uptime:'UPTIME',lastRenew:'LAST RENEW',cyclePeriod:'CYCLE',actions:'ACTIONS',cycle:'CYCLE',reset:'RESET',disabled:'DISABLED',days:'DAYS',daysUnit:'DAYS',typeReset:'RESET',typeCycle:'CYCLE',lunarCal:'Lunar',lbOffline:'OFFLINE',unit:{day:'DAY',month:'MTH',year:'YR'},editService:'EDIT SERVICE',newService:'NEW SERVICE',formName:'NAME',namePlaceholder:'e.g. Netflix',formType:'MODE',createDate:'CREATE DATE',interval:'INTERVAL',note:'NOTE',status:'STATUS',active:'ACTIVE',disabledText:'DISABLED',cancel:'CANCEL',save:'SAVE DATA',saveSettings:'SAVE CONFIG',settingsTitle:'SYSTEM CONFIG',setNotify:'NOTIFICATION',pushSwitch:'MASTER PUSH',pushUrl:'WEBHOOK URL',notifyThreshold:'ALERT THRESHOLD',setAuto:'AUTOMATION',autoRenewSwitch:'AUTO RENEW',autoRenewThreshold:'RENEW AFTER',autoDisableThreshold:'DISABLE AFTER',daysOverdue:'DAYS OVERDUE',sysLogs:'SYSTEM LOGS',execLogs:'EXECUTION LOGS',clearHistory:'CLEAR HISTORY',noLogs:'NO DATA',liveLog:'LIVE TERMINAL',btnExport: 'Export Data',btnImport: 'Import Data',btnTest: 'Send Test',btnRefresh:'REFRESH',
             lblEnable: 'Enable', lblToken: 'Token', lblApiKey: 'API Key', lblChatId: 'Chat ID', 
@@ -2557,7 +2541,7 @@ const HTML = `<!DOCTYPE html>
             lblHeaders: 'Headers (JSON)', lblBody: 'Body (JSON)',
             lblCorpId: 'CorpID', lblAgentId: 'AgentID', lblSecret: 'Secret', lblToUser: 'ToUser',
             lblStatus: 'Status', lblMode: 'Mode', lblInterval: 'Interval', lblCreateDate: 'Create Date', lblLastRenew: 'Last Renew',
-            tag:{alert:'ALERT',renew:'RENEWED',disable:'DISABLED',normal:'NORMAL'},msg:{confirmRenew: 'Renew [%s] to today based on your timezone?',renewSuccess: 'Renewed! Date updated: %s -> %t',tokenReset: 'Token Reset. Update your calendar apps.', copyOk: 'Link Copied', exportSuccess: 'Backup Downloaded',importSuccess: 'Restore Success, Refreshing...',importFail: 'Import Failed, Check File Format',passReq:'Password Required',saved:'Data Saved',saveFail:'Save Failed',cleared:'Cleared',clearFail:'Clear Failed',loginFail:'Access Denied',loadLogFail:'Load Failed',confirmDel:'Confirm Delete?',dateError:'Last renew date cannot be earlier than create date',nameReq:'Name Required',nameExist:'Name already exists',futureError:'Renew date cannot be in the future',serviceDisabled:'Service Disabled',serviceEnabled:'Service Enabled',execFinish: 'EXECUTION FINISHED!'},tags:'TAGS',tagPlaceholder:'Press Enter to create tag',searchPlaceholder:'Search...',tagsCol:'TAGS',tagAll:'ALL',useLunar:'Lunar Cycle',lunarTip:'Calculate based on Lunar calendar',yes:'Yes',no:'No',timezone:'Timezone',disabledFilter:'DISABLED',policyConfig:'Policy Config',policyNotify:'Notify Days',policyAuto:'Auto Renew',policyRenewDay:'Renew Days',useGlobal:'Global Default',autoRenewOnDesc:'Auto Renew when overdue',autoRenewOffDesc:'Auto Disable when overdue',previewCalc:'Based on Last Renew Date & Interval',nextDue:'NEXT DUE',
+            tag:{alert:'ALERT',renew:'RENEWED',disable:'DISABLED',normal:'NORMAL'},msg:{confirmRenew: 'Confirm to extend [%s] expiration date by one cycle?',renewSuccess: 'Renewed! Date updated: %s -> %t',tokenReset: 'Token Reset. Update your calendar apps.', copyOk: 'Link Copied', exportSuccess: 'Backup Downloaded',importSuccess: 'Restore Success, Refreshing...',importFail: 'Import Failed, Check File Format',passReq:'Password Required',saved:'Data Saved',saveFail:'Save Failed',cleared:'Cleared',clearFail:'Clear Failed',loginFail:'Access Denied',loadLogFail:'Load Failed',confirmDel:'Confirm Delete?',dateError:'Last renew date cannot be earlier than create date',nameReq:'Name Required',nameExist:'Name already exists',futureError:'Renew date cannot be in the future',serviceDisabled:'Service Disabled',serviceEnabled:'Service Enabled',execFinish: 'EXECUTION FINISHED!'},tags:'TAGS',tagPlaceholder:'Press Enter to create tag',searchPlaceholder:'Search...',tagsCol:'TAGS',tagAll:'ALL',useLunar:'Lunar Cycle',lunarTip:'Calculate based on Lunar calendar',yes:'Yes',no:'No',timezone:'Timezone',disabledFilter:'DISABLED',policyConfig:'Policy Config',policyNotify:'Notify Days',policyAuto:'Auto Renew',policyRenewDay:'Renew Days',useGlobal:'Global Default',autoRenewOnDesc:'Auto Renew when overdue',autoRenewOffDesc:'Auto Disable when overdue',previewCalc:'Based on Last Renew Date & Interval',nextDue:'NEXT DUE',
             colDetails: 'Details', amount: 'Amount', purchaseUrl: 'Purchase URL', purchaseAccount: 'Account', purchasePassword: 'Password', detailsTitle: 'SERVICE DETAILS', currency: 'Currency'}
         };
         const LUNAR={info:[0x04bd8,0x04ae0,0x0a570,0x054d5,0x0d260,0x0d950,0x16554,0x056a0,0x09ad0,0x055d2,0x04ae0,0x0a5b6,0x0a4d0,0x0d250,0x1d255,0x0b540,0x0d6a0,0x0ada2,0x095b0,0x14977,0x04970,0x0a4b0,0x0b4b5,0x06a50,0x06d40,0x1ab54,0x02b60,0x09570,0x052f2,0x04970,0x06566,0x0d4a0,0x0ea50,0x06e95,0x05ad0,0x02b60,0x186e3,0x092e0,0x1c8d7,0x0c950,0x0d4a0,0x1d8a6,0x0b550,0x056a0,0x1a5b4,0x025d0,0x092d0,0x0d2b2,0x0a950,0x0b557,0x06ca0,0x0b550,0x15355,0x04da0,0x0a5b0,0x14573,0x052b0,0x0a9a8,0x0e950,0x06aa0,0x0aea6,0x0ab50,0x04b60,0x0aae4,0x0a570,0x05260,0x0f263,0x0d950,0x05b57,0x056a0,0x096d0,0x04dd5,0x04ad0,0x0a4d0,0x0d4d4,0x0d250,0x0d558,0x0b540,0x0b6a0,0x195a6,0x095b0,0x049b0,0x0a974,0x0a4b0,0x0b27a,0x06a50,0x06d40,0x0af46,0x0ab60,0x09570,0x04af5,0x04970,0x064b0,0x074a3,0x0ea50,0x06b58,0x055c0,0x0ab60,0x096d5,0x092e0,0x0c960,0x0d954,0x0d4a0,0x0da50,0x07552,0x056a0,0x0abb7,0x025d0,0x092d0,0x0cab5,0x0a950,0x0b4a0,0x0baa4,0x0ad50,0x055d9,0x04ba0,0x0a5b0,0x15176,0x052b0,0x0a930,0x07954,0x06aa0,0x0ad50,0x05b52,0x04b60,0x0a6e6,0x0a4e0,0x0d260,0x0ea65,0x0d530,0x05aa0,0x076a3,0x096d0,0x04bd7,0x04ad0,0x0a4d0,0x1d0b6,0x0d250,0x0d520,0x0dd45,0x0b5a0,0x056d0,0x055b2,0x049b0,0x0a577,0x0a4b0,0x0aa50,0x1b255,0x06d20,0x0ada0,0x14b63,0x09370,0x049f8,0x04970,0x064b0,0x168a6,0x0ea50,0x06b20,0x1a6c4,0x0aae0,0x0a2e0,0x0d2e3,0x0c960,0x0d557,0x0d4a0,0x0da50,0x05d55,0x056a0,0x0a6d0,0x055d4,0x052d0,0x0a9b8,0x0a950,0x0b4a0,0x0b6a6,0x0ad50,0x055a0,0x0aba4,0x0a5b0,0x052b0,0x0b273,0x06930,0x07337,0x06aa0,0x0ad50,0x14b55,0x04b60,0x0a570,0x054e4,0x0d160,0x0e968,0x0d520,0x0daa0,0x16aa6,0x056d0,0x04ae0,0x0a9d4,0x0a2d0,0x0d150,0x0f252,0x0d520],gan:'甲乙丙丁戊己庚辛壬癸'.split(''),zhi:'子丑寅卯辰巳午未申酉戌亥'.split(''),months:'正二三四五六七八九十冬腊'.split(''),days:'初一,初二,初三,初四,初五,初六,初七,初八,初九,初十,十一,十二,十三,十四,十五,十六,十七,十八,十九,二十,廿一,廿二,廿三,廿四,廿五,廿六,廿七,廿八,廿九,三十'.split(','),lYearDays(y){let s=348;for(let i=0x8000;i>0x8;i>>=1)s+=(this.info[y-1900]&i)?1:0;return s+this.leapDays(y)},leapDays(y){if(this.leapMonth(y))return(this.info[y-1900]&0x10000)?30:29;return 0},leapMonth(y){return this.info[y-1900]&0xf},monthDays(y,m){return(this.info[y-1900]&(0x10000>>m))?30:29},solar2lunar(y,m,d){if(y<1900||y>2100)return null;const base=new Date(1900,0,31),obj=new Date(y,m-1,d);let offset=Math.round((obj-base)/86400000);let ly=1900,temp=0;for(;ly<2101&&offset>0;ly++){temp=this.lYearDays(ly);offset-=temp}if(offset<0){offset+=temp;ly--}let lm=1,leap=this.leapMonth(ly),isLeap=false;for(;lm<13&&offset>0;lm++){if(leap>0&&lm===(leap+1)&&!isLeap){--lm;isLeap=true;temp=this.leapDays(ly)}else{temp=this.monthDays(ly,lm)}if(isLeap&&lm===(leap+1))isLeap=false;offset-=temp}if(offset===0&&leap>0&&lm===leap+1){if(isLeap)isLeap=false;else{isLeap=true;--lm}}if(offset<0){offset+=temp;--lm}const ld=offset+1,gIdx=(ly-4)%10,zIdx=(ly-4)%12;const yStr=this.gan[gIdx<0?gIdx+10:gIdx]+this.zhi[zIdx<0?zIdx+12:zIdx];const mStr=(isLeap?'闰':'')+this.months[lm-1]+'月';return{year:ly,month:lm,day:ld,isLeap,yearStr:yStr,monthStr:mStr,dayStr:this.days[ld-1],fullStr:yStr+'年'+mStr+this.days[ld-1]}}};
@@ -2568,6 +2552,16 @@ const HTML = `<!DOCTYPE html>
             const p = s.split('-'); 
             return new Date(p[0], p[1]-1, p[2]); 
         };
+        
+        // 格式化日期为 YYYY-MM-DD
+        const toYMD = (date) => {
+            if (!date) return '';
+            const d = new Date(date);
+            const year = d.getFullYear();
+            const month = String(d.getMonth() + 1).padStart(2, '0');
+            const day = String(d.getDate()).padStart(2, '0');
+            return year + '-' + month + '-' + day;
+        };
 
         createApp({
             setup() {
@@ -2575,14 +2569,14 @@ const HTML = `<!DOCTYPE html>
                 const dataVersion = ref(0); // 新增版本号状态
                 const dialogVisible = ref(false), settingsVisible = ref(false), historyVisible = ref(false), historyLoading = ref(false), historyLogs = ref([]), detailsVisible = ref(false), currentDetailItem = ref(null);
                 const showDetails = (item) => { currentDetailItem.value = item; detailsVisible.value = true; };
-                const checking = ref(false), logs = ref([]), displayLogs = ref([]), isEdit = ref(false), lang = ref('zh'), currentTag = ref(''), searchKeyword = ref('');
+                const checking = ref(false), logs = ref([]), displayLogs = ref([]), isEdit = ref(false), lang = ref('zh'), currentTag = ref('');
                 const locale = ref(ZhCn), tableKey = ref(0), termRef = ref(null);
-                const form = ref({ id:'', name:'', createDate:'', lastRenewDate:'', intervalDays:30, cycleUnit:'day', type:'cycle', message:'', enabled:true, tags:[], useLunar:false, notifyDays:3, notifyTime: '08:00', autoRenew:true, autoRenewDays:3, amount: 0, currency: 'CNY', purchaseUrl: '', purchaseAccount: '', purchasePassword: '' });
+                const form = ref({ id:'', name:'', createDate:'', lastRenewDate:'', intervalDays:30, cycleUnit:'day', type:'cycle', message:'', enabled:true, tags:[], useLunar:false, notifyDays:3, notifyTime: '08:00', autoRenew:false, autoRenewDays:3, amount: 0, currency: 'CNY', transactionType: 'expense', nextDueDate: '', purchaseUrl: '', purchaseAccount: '', purchasePassword: '' });
                 const settingsForm = ref({ 
                     notifyUrl:'', 
                     enableNotify:true, 
                     autoDisableDays:30, 
-                    timezone:'UTC',
+                    timezone:'Asia/Shanghai',
                     enabledChannels: [],
                     notifyConfig: { telegram: {}, bark: {}, pushplus: {}, notifyx: {}, resend: {}, webhook: {}, webhook2: {}, webhook3: {}, gotify: {}, ntfy: {}, wechat: {} },
                     calendarToken: ''
@@ -2609,13 +2603,15 @@ const HTML = `<!DOCTYPE html>
                 const updateWidth = () => windowWidth.value = window.innerWidth;
                 const drawerSize = computed(() => windowWidth.value < 640 ? '100%' : '600px'); // 640px matching tailwind sm
                 const actionColWidth = computed(() => windowWidth.value < 640 ? 100 : 180);
-                const paginationLayout = computed(() => windowWidth.value < 640 ? 'prev, pager, next, jumper' : 'total, sizes, prev, pager, next, jumper');
-                // 2. 定义分页状态
-                const currentPage = ref(1);
-                const pageSize = ref(10); // 默认每页显示 10 条
-                const sortState = ref({ prop: 'daysLeft', order: 'ascending' });
+                // 从localStorage恢复排序状态
+                const savedSortState = localStorage.getItem('tableSortState');
+                const sortState = ref(savedSortState ? JSON.parse(savedSortState) : { prop: 'daysLeft', order: 'ascending' });
                 const filterState = ref({});
-                const handleSortChange = ({ prop, order }) => { sortState.value = { prop, order }; };
+                const handleSortChange = ({ prop, order }) => { 
+                    sortState.value = { prop, order }; 
+                    // 保存到localStorage
+                    localStorage.setItem('tableSortState', JSON.stringify({ prop, order }));
+                };
                 const handleFilterChange = (filters) => { filterState.value = { ...filterState.value, ...filters }; };
                 const nextDueFilters = computed(() => [
                     { text: t('filter.expired'), value: 'expired' },
@@ -2647,7 +2643,6 @@ const HTML = `<!DOCTYPE html>
                     let r = list.value;
                     if (currentTag.value === 'DISABLED') r = r.filter(i => !i.enabled);
                     else if (currentTag.value) r = r.filter(i => (i.tags||[]).includes(currentTag.value));
-                    if (searchKeyword.value) { const k=searchKeyword.value.toLowerCase(); r = r.filter(i => i.name.toLowerCase().includes(k) || (i.message||'').toLowerCase().includes(k)); }
 
                     if (filterState.value.daysLeft && filterState.value.daysLeft.length > 0) {
                         const fv = filterState.value.daysLeft;
@@ -2816,13 +2811,67 @@ const HTML = `<!DOCTYPE html>
                     } finally { loading.value=false; }
                 };
 
-                const getLocalToday = () => { try { const tz = settings.value.timezone || 'UTC'; return new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date()); } catch(e) { return new Date().toISOString().split('T')[0]; } };
+                const getLocalToday = () => { try { const tz = settings.value.timezone || 'Asia/Shanghai'; return new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date()); } catch(e) { return new Date().toISOString().split('T')[0]; } };
+
+                // 计算下次到期日期的辅助函数
+                const calculateNextDueDate = (baseDate, intervalDays, cycleUnit, useLunar) => {
+                    if (!baseDate || !intervalDays) return null;
+                    const baseObj = parseYMD(baseDate);
+                    const interval = Number(intervalDays);
+                    const unit = cycleUnit || 'day';
+                    let nextDate;
+
+                    if (useLunar) {
+                        const l = LUNAR.solar2lunar(
+                            baseObj.getFullYear(),
+                            baseObj.getMonth() + 1,
+                            baseObj.getDate()
+                        );
+                        if (l) {
+                            const nl = frontendCalc.addPeriod({ year: l.year, month: l.month, day: l.day, isLeap: l.isLeap }, interval, unit);
+                            const ns = frontendCalc.l2s(nl);
+                            nextDate = new Date(Date.UTC(ns.year, ns.month - 1, ns.day));
+                        } else {
+                            nextDate = new Date(baseObj);
+                            if (unit === 'year') {
+                                nextDate.setFullYear(nextDate.getFullYear() + interval);
+                            } else if (unit === 'month') {
+                                nextDate.setMonth(nextDate.getMonth() + interval);
+                            } else {
+                                nextDate.setDate(nextDate.getDate() + interval);
+                            }
+                        }
+                    } else {
+                        nextDate = new Date(baseObj);
+                        if (unit === 'year') {
+                            nextDate.setFullYear(nextDate.getFullYear() + interval);
+                        } else if (unit === 'month') {
+                            nextDate.setMonth(nextDate.getMonth() + interval);
+                        } else {
+                            nextDate.setDate(nextDate.getDate() + interval);
+                        }
+                    }
+                    return toYMD(nextDate);
+                };
 
                 const saveItem = async () => {
                     if(!form.value.name.trim()) return ElMessage.error(t('msg.nameReq'));
                     if(list.value.some(i=>i.name.toLowerCase()===form.value.name.toLowerCase() && i.id!==form.value.id)) return ElMessage.error(t('msg.nameExist'));
                     if(form.value.lastRenewDate < form.value.createDate) return ElMessage.error(t('msg.dateError'));
                     if(form.value.lastRenewDate > getLocalToday()) return ElMessage.error(t('msg.futureError'));
+                    
+                    // 如果是新增，或者编辑时没有 nextDueDate，则基于 lastRenewDate 计算 nextDueDate
+                    if (!isEdit.value || !form.value.nextDueDate) {
+                        const calculatedNextDue = calculateNextDueDate(
+                            form.value.lastRenewDate,
+                            form.value.intervalDays,
+                            form.value.cycleUnit,
+                            form.value.useLunar
+                        );
+                        if (calculatedNextDue) {
+                            form.value.nextDueDate = calculatedNextDue;
+                        }
+                    }
                     
                     let newList=[...list.value];
                     if(isEdit.value) { const i=newList.findIndex(x=>x.id===form.value.id); if(i!==-1) newList[i]=form.value; }
@@ -2891,7 +2940,7 @@ const HTML = `<!DOCTYPE html>
                 const formatLogTime = (isoStr) => {
                     if (!isoStr) return '';
                     try {
-                        const tz = settings.value.timezone || 'UTC';
+                        const tz = settings.value.timezone || 'Asia/Shanghai';
                         const date = new Date(isoStr);
                         const timeStr = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(date).replace(', ', ' ');
                         const offsetPart = new Intl.DateTimeFormat('en-US', { timeZone: tz, timeZoneName: 'shortOffset' }).formatToParts(date).find(p => p.type === 'timeZoneName').value;
@@ -2900,8 +2949,29 @@ const HTML = `<!DOCTYPE html>
                     } catch (e) { return isoStr; }
                 };                
 
-                const openAdd = () => { isEdit.value=false; const d=getLocalToday(); form.value={id:Date.now().toString(),name:'',createDate:d,lastRenewDate:d,intervalDays:30,cycleUnit:'day',type:'cycle',enabled:true,tags:[],useLunar:false, notifyDays:3, notifyTime: '08:00', autoRenew:true, autoRenewDays:3, amount: 0, currency: 'CNY', purchaseUrl: '', purchaseAccount: '', purchasePassword: ''}; dialogVisible.value=true; };
-                const editItem = (row) => { isEdit.value=true; form.value={...row,cycleUnit:row.cycleUnit||'day',tags:[...(row.tags||[])],useLunar:!!row.useLunar, notifyDays:(row.notifyDays!==undefined?row.notifyDays:3), notifyTime: (row.notifyTime || '08:00'), autoRenew:row.autoRenew!==false, autoRenewDays:(row.autoRenewDays!==undefined?row.autoRenewDays:3), amount: row.amount || 0, currency: row.currency || 'CNY', purchaseUrl: row.purchaseUrl || '', purchaseAccount: row.purchaseAccount || '', purchasePassword: row.purchasePassword || ''}; dialogVisible.value=true; };
+                const openAdd = () => { isEdit.value=false; const d=getLocalToday(); form.value={id:Date.now().toString(),name:'',createDate:d,lastRenewDate:d,intervalDays:30,cycleUnit:'day',type:'cycle',enabled:true,tags:[],useLunar:false, notifyDays:3, notifyTime: '08:00', autoRenew:false, autoRenewDays:3, amount: 0, currency: 'CNY', transactionType: 'expense', nextDueDate: '', purchaseUrl: '', purchaseAccount: '', purchasePassword: ''}; dialogVisible.value=true; };
+                const editItem = (row) => { 
+                    isEdit.value=true; 
+                    form.value={
+                        ...row,
+                        type:row.type||'cycle',
+                        cycleUnit:row.cycleUnit||'day',
+                        tags:[...(row.tags||[])],
+                        useLunar:!!row.useLunar, 
+                        notifyDays:(row.notifyDays!==undefined?row.notifyDays:3), 
+                        notifyTime: (row.notifyTime || '08:00'), 
+                        autoRenew:row.autoRenew!==false, 
+                        autoRenewDays:(row.autoRenewDays!==undefined?row.autoRenewDays:3), 
+                        amount: row.amount || 0, 
+                        currency: row.currency || 'CNY', 
+                        transactionType: row.transactionType || 'expense', 
+                        purchaseUrl: row.purchaseUrl || '', 
+                        purchaseAccount: row.purchaseAccount || '', 
+                        purchasePassword: row.purchasePassword || '',
+                        nextDueDate: row.nextDueDate || '' // 确保 nextDueDate 被正确传递
+                    }; 
+                    dialogVisible.value=true; 
+                };
                 const openSettings = () => { 
                     settingsForm.value = JSON.parse(JSON.stringify(settings.value)); 
                     // 确保 notifyConfig 中的所有渠道都初始化
@@ -2988,14 +3058,58 @@ const HTML = `<!DOCTYPE html>
                 const getTagCount = (t) => list.value.filter(i=>(i.tags||[]).includes(t)).length;
 
                 const manualRenew = async (row) => {
-                    const todayStr = getLocalToday();
-                    const oldDate = row.lastRenewDate;
-                    row.lastRenewDate = todayStr;
+                    // 基于 nextDueDate 往后推一个周期
+                    const nextDueDateObj = parseYMD(row.nextDueDate);
+                    const interval = Number(row.intervalDays);
+                    const unit = row.cycleUnit || 'day';
+                    let newNextDueDate;
 
+                    if (row.useLunar) {
+                        const l = LUNAR.solar2lunar(
+                            nextDueDateObj.getFullYear(),
+                            nextDueDateObj.getMonth() + 1,
+                            nextDueDateObj.getDate()
+                        );
+                        if (l) {
+                            const nl = frontendCalc.addPeriod({ year: l.year, month: l.month, day: l.day, isLeap: l.isLeap }, interval, unit);
+                            const ns = frontendCalc.l2s(nl);
+                            newNextDueDate = new Date(Date.UTC(ns.year, ns.month - 1, ns.day));
+                        } else {
+                            newNextDueDate = new Date(nextDueDateObj);
+                            if (unit === 'year') {
+                                newNextDueDate.setFullYear(newNextDueDate.getFullYear() + interval);
+                            } else if (unit === 'month') {
+                                newNextDueDate.setMonth(newNextDueDate.getMonth() + interval);
+                            } else {
+                                newNextDueDate.setDate(newNextDueDate.getDate() + interval);
+                            }
+                        }
+                    } else {
+                        newNextDueDate = new Date(nextDueDateObj);
+                        if (unit === 'year') {
+                            newNextDueDate.setFullYear(newNextDueDate.getFullYear() + interval);
+                        } else if (unit === 'month') {
+                            newNextDueDate.setMonth(newNextDueDate.getMonth() + interval);
+                        } else {
+                            newNextDueDate.setDate(newNextDueDate.getDate() + interval);
+                        }
+                    }
+
+                    const oldNextDueDate = row.nextDueDate;
+                    const todayStr = getLocalToday();
+                    
+                    // 更新 nextDueDate，同时更新 lastRenewDate 作为记录
+                    row.nextDueDate = toYMD(newNextDueDate);
+                    row.lastRenewDate = todayStr; // 记录续期日期为今天
+
+                    // 保存数据
                     await saveData(null, null, false);
+                    
+                    // 刷新列表以更新显示
+                    await fetchList();
 
                     tableKey.value++; 
-                    ElMessage.success(t('msg.renewSuccess').replace('%s', oldDate).replace('%t', todayStr));
+                    ElMessage.success((lang.value === 'zh' ? '续期成功！下次到期日已更新: ' : 'Renewed! Next due date updated: ') + oldNextDueDate + ' -> ' + row.nextDueDate);
                 };
 
                 const timezoneList = [
@@ -3052,7 +3166,7 @@ const HTML = `<!DOCTYPE html>
                         // --- 步骤 2: 获取“用户偏好时区”的“今天” ---
                         let todayInUserTzStr;
                         try {
-                            const userTz = settings.value.timezone || 'UTC';
+                            const userTz = settings.value.timezone || 'Asia/Shanghai';
                             // 使用 Intl 格式化出用户时区的 YYYY-MM-DD
                             const fmt = new Intl.DateTimeFormat('en-CA', { 
                                 timeZone: userTz, 
@@ -3080,14 +3194,79 @@ const HTML = `<!DOCTYPE html>
                     }
                 });
 
-                const pagedList = computed(() => {
-                    const start = (currentPage.value - 1) * pageSize.value;
-                    const end = start + pageSize.value;
-                    return filteredList.value.slice(start, end);
+                const editDueDiff = computed(() => {
+                    if (!isEdit.value || !form.value.nextDueDate) return '';
+                    try {
+                        const parts = String(form.value.nextDueDate).split('-');
+                        if (parts.length !== 3) return '';
+                        const nextDateUTC = new Date(Date.UTC(+parts[0], +parts[1] - 1, +parts[2]));
+
+                        let todayInUserTzStr;
+                        try {
+                            const userTz = settings.value.timezone || 'Asia/Shanghai';
+                            const fmt = new Intl.DateTimeFormat('en-CA', {
+                                timeZone: userTz,
+                                year: 'numeric',
+                                month: '2-digit',
+                                day: '2-digit',
+                            });
+                            todayInUserTzStr = fmt.format(new Date());
+                        } catch (e) {
+                            todayInUserTzStr = new Date().toISOString().split('T')[0];
+                        }
+
+                        const pToday = todayInUserTzStr.split('-');
+                        const todayUTC = new Date(Date.UTC(+pToday[0], +pToday[1] - 1, +pToday[2]));
+                        const diff = Math.round((nextDateUTC - todayUTC) / (1000 * 3600 * 24));
+
+                        const labelStart = lang.value === 'zh' ? '距今 ' : 'Due in ';
+                        const labelEnd = lang.value === 'zh' ? ' 天' : ' Days';
+                        return labelStart + (diff > 0 ? '+' : '') + diff + labelEnd;
+                    } catch (e) {
+                        console.error(e);
+                        return '';
+                    }
                 });
 
-                watch([currentTag, searchKeyword], () => {
-                    currentPage.value = 1;
+                // 计算每月和每年的收入/支出
+                const monthlyIncome = computed(() => {
+                    return list.value.filter(i => i.enabled && i.transactionType === 'income' && i.amount).reduce((sum, i) => {
+                        const amount = Number(i.amount) || 0;
+                        const cycleUnit = i.cycleUnit || 'day';
+                        const intervalDays = Number(i.intervalDays) || 1;
+                        if (cycleUnit === 'month') {
+                            return sum + amount / intervalDays;
+                        } else if (cycleUnit === 'year') {
+                            return sum + amount / (intervalDays * 12);
+                        } else if (cycleUnit === 'day') {
+                            return sum + amount * (30 / intervalDays);
+                        }
+                        return sum;
+                    }, 0);
+                });
+
+                const monthlyExpense = computed(() => {
+                    return list.value.filter(i => i.enabled && i.transactionType === 'expense' && i.amount).reduce((sum, i) => {
+                        const amount = Number(i.amount) || 0;
+                        const cycleUnit = i.cycleUnit || 'day';
+                        const intervalDays = Number(i.intervalDays) || 1;
+                        if (cycleUnit === 'month') {
+                            return sum + amount / intervalDays;
+                        } else if (cycleUnit === 'year') {
+                            return sum + amount / (intervalDays * 12);
+                        } else if (cycleUnit === 'day') {
+                            return sum + amount * (30 / intervalDays);
+                        }
+                        return sum;
+                    }, 0);
+                });
+
+                const yearlyIncome = computed(() => {
+                    return monthlyIncome.value * 12;
+                });
+
+                const yearlyExpense = computed(() => {
+                    return monthlyExpense.value * 12;
                 });
                 const importRef = ref(null);
                 const exportData = async () => {
@@ -3121,16 +3300,17 @@ const HTML = `<!DOCTYPE html>
                 return {
                     tableKey, termRef, isLoggedIn, password, login, logout, loading, list, settings, lang, toggleLang, setLang, t, locale, disabledCount,
                     dialogVisible, settingsVisible, historyVisible, historyLoading, historyLogs, checking, logs, displayLogs, form, settingsForm, isEdit,
-                    expiringCount, expiredCount, currentTag, allTags, filteredList, searchKeyword, logVisible,formatLogTime,Upload, Download,
+                    expiringCount, expiredCount, currentTag, allTags, filteredList, logVisible,formatLogTime,Upload, Download,
                     openAdd, editItem, deleteItem, saveItem, openSettings, saveSettings, runCheck, openHistoryLogs, clearLogs, toggleEnable,importRef, exportData, triggerImport, handleImportFile,
                     Edit, Delete, Plus, VideoPlay, Setting, Bell, Document, Lock, Monitor, SwitchButton, Calendar, Timer, Files, AlarmClock, Warning, Search, Cpu, Link, Message, Promotion, Iphone, Moon, Sunny, ArrowDown, View, User, Wallet, CreditCard, Money,
                     getDaysClass, formatDaysLeft, getTagClass, getLogColor, getLunarStr, getYearGanZhi, getSmartLunarText, getLunarTooltip, getMonthStr, getTagCount, tableRowClassName, channelMap, toggleChannel, testChannel, testing,
                     expandedChannels,
-                    calendarUrl, copyIcsUrl, resetCalendarToken,manualRenew,RefreshRight,timezoneList,currentPage, pageSize, pagedList, previewData,
-                    isDark, toggleTheme, drawerSize, actionColWidth, paginationLayout, confirmDelete, confirmRenew, More, windowWidth,
+                    calendarUrl, copyIcsUrl, resetCalendarToken,manualRenew,RefreshRight,timezoneList, previewData, editDueDiff,
+                    isDark, toggleTheme, drawerSize, actionColWidth, confirmDelete, confirmRenew, More, windowWidth,
                     handleSortChange, handleFilterChange, 
                     nextDueFilters, typeFilters, uptimeFilters, lastRenewFilters,
-                    detailsVisible, currentDetailItem, showDetails
+                    detailsVisible, currentDetailItem, showDetails,
+                    monthlyIncome, monthlyExpense, yearlyIncome, yearlyExpense
                 };
             }
         }).use(ElementPlus).mount('#app');
